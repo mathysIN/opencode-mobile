@@ -8,7 +8,7 @@ interface Props {
 }
 
 export function ReasoningBlock({ text, isDark }: Props) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(true)
 
   return (
     <TouchableOpacity

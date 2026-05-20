@@ -310,7 +310,7 @@ interface Props {
 }
 
 export function ToolCallCard({ tool, isDark }: Props) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(true)
   const icon = (tool.tool && TOOL_ICONS[tool.tool]) || "extension-puzzle-outline"
   const status = tool.state?.status || "pending"
   const color = statusColor(status)
