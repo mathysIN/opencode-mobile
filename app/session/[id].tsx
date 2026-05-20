@@ -461,7 +461,7 @@ export default function SessionScreen() {
       <KeyboardAvoidingView
         style={[s.container, isDark && s.containerDark]}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
+        keyboardVerticalOffset={Platform.OS === "ios" ? 140 : 100}
       >
         {/* Session info pulldown */}
         <SessionInfo
@@ -581,7 +581,7 @@ export default function SessionScreen() {
 
         {/* Input */}
         <View
-          style={[s.inputContainer, isDark && s.inputContainerDark, { paddingBottom: Math.max(12, insets.bottom) }]}
+          style={[s.inputContainer, isDark && s.inputContainerDark, { paddingBottom: insets.bottom }]}
         >
           <View style={s.inputRow}>
             {/* Attach button */}
@@ -735,7 +735,7 @@ const s = StyleSheet.create({
 
   // Input
   inputContainer: {
-    padding: 12,
+    padding: 16,
     borderTopWidth: 1,
     borderTopColor: "#e5e5e5",
     backgroundColor: "#ffffff",
@@ -747,16 +747,16 @@ const s = StyleSheet.create({
   },
   attachBtn: {
     width: 36,
-    height: 40,
+    height: 48,
     justifyContent: "center",
     alignItems: "center",
   },
   input: {
     flex: 1,
     backgroundColor: "#f5f5f5",
-    borderRadius: 20,
+    borderRadius: 24,
     paddingHorizontal: 16,
-    paddingVertical: 10,
+    paddingVertical: 14,
     fontSize: 16,
     maxHeight: 120,
     color: "#0a0a0a",
@@ -764,9 +764,9 @@ const s = StyleSheet.create({
   inputDark: { backgroundColor: "#1a1a1a", color: "#ffffff" },
   inputListening: { borderWidth: 1, borderColor: "#ef4444" },
   sendBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
     backgroundColor: "#0a0a0a",
     justifyContent: "center",
     alignItems: "center",
@@ -774,26 +774,26 @@ const s = StyleSheet.create({
   },
   sendBtnDisabled: { backgroundColor: "#cccccc" },
   micBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
     justifyContent: "center",
     alignItems: "center",
     marginLeft: 8,
   },
   micBtnActive: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
     backgroundColor: "#ef4444",
     justifyContent: "center",
     alignItems: "center",
     marginLeft: 8,
   },
   stopBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
     backgroundColor: "#ef4444",
     justifyContent: "center",
     alignItems: "center",
