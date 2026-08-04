@@ -1,6 +1,7 @@
 import { useEffect, type ReactNode } from "react"
 import { View, Text, TouchableOpacity, StyleSheet, useColorScheme } from "react-native"
 import { Ionicons } from "@expo/vector-icons"
+import { useTranslation } from "react-i18next"
 import { useAuth } from "../stores/auth"
 
 interface Props {
@@ -10,8 +11,19 @@ interface Props {
 export function AuthGate({ children }: Props) {
   const colorScheme = useColorScheme()
   const isDark = colorScheme === "dark"
+  const { t } = useTranslation()
 
   const { isAuthenticated, settings, hasBiometrics, biometricType, authenticate, error } = useAuth()
+
+  // Auto-prompt the OS biometric dialog once when the lock screen appears, so users
+  // aren't forced to tap "Unlock" on every cold start. If they cancel/fail, the
+  // manual "Unlock" button below is the fallback.
+  useEffect(() => {
+    if (settings.requireBiometric && hasBiometrics && !isAuthenticated) {
+      authenticate()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // If biometric not required, or no biometrics available, show children
   if (!settings.requireBiometric || !hasBiometrics) {
@@ -35,14 +47,14 @@ export function AuthGate({ children }: Props) {
     <View style={[styles.container, isDark && styles.containerDark]}>
       <View style={styles.content}>
         <Ionicons name={iconName} size={64} color={isDark ? "#ffffff" : "#0a0a0a"} />
-        <Text style={[styles.title, isDark && styles.textDark]}>OpenCode Locked</Text>
-        <Text style={[styles.subtitle, isDark && styles.subtitleDark]}>Authenticate to access your sessions</Text>
+        <Text style={[styles.title, isDark && styles.textDark]}>{t("authGate.title")}</Text>
+        <Text style={[styles.subtitle, isDark && styles.subtitleDark]}>{t("authGate.subtitle")}</Text>
 
         {error && <Text style={styles.error}>{error}</Text>}
 
         <TouchableOpacity style={[styles.button, isDark && styles.buttonDark]} onPress={authenticate}>
           <Ionicons name={iconName} size={24} color={isDark ? "#0a0a0a" : "#ffffff"} />
-          <Text style={[styles.buttonText, isDark && styles.buttonTextDark]}>Unlock</Text>
+          <Text style={[styles.buttonText, isDark && styles.buttonTextDark]}>{t("authGate.unlockButton")}</Text>
         </TouchableOpacity>
       </View>
     </View>

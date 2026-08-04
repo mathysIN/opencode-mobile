@@ -12,9 +12,10 @@ import {
   ActivityIndicator,
   Alert,
 } from "react-native"
-import { useLocalSearchParams, Stack, useRouter } from "expo-router"
+import { useLocalSearchParams, Stack, useRouter, useFocusEffect } from "expo-router"
 import { Ionicons } from "@expo/vector-icons"
 import { useSafeAreaInsets } from "react-native-safe-area-context"
+import { useTranslation } from "react-i18next"
 import * as ImagePicker from "expo-image-picker"
 import * as ImageManipulator from "expo-image-manipulator"
 import * as Clipboard from "expo-clipboard"
@@ -26,6 +27,7 @@ import {
   StatusIndicator,
   SlashPopover,
   ModelPicker,
+  VariantPicker,
   ImageAttachments,
   SessionInfo,
   type SlashCommand,
@@ -61,14 +63,6 @@ const BUILTIN_COMMANDS: SlashCommand[] = [
     icon: "person-outline",
     type: "builtin",
   },
-  {
-    trigger: "compact",
-    title: "Compact",
-    description: "Summarize conversation",
-    icon: "contract-outline",
-    type: "builtin",
-  },
-  { trigger: "clear", title: "Clear", description: "Clear the session", icon: "trash-outline", type: "builtin" },
 ]
 
 function getShortDir(dir?: string): string | null {
@@ -83,9 +77,11 @@ export default function SessionScreen() {
   const colorScheme = useColorScheme()
   const isDark = colorScheme === "dark"
   const insets = useSafeAreaInsets()
+  const { t } = useTranslation()
 
   const flatListRef = useRef<FlatList>(null)
   const modelSheetRef = useRef<BottomSheet>(null)
+  const variantSheetRef = useRef<BottomSheet>(null)
   const [input, setInput] = useState("")
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [showInfo, setShowInfo] = useState(false)
@@ -101,13 +97,21 @@ export default function SessionScreen() {
     sendMessage,
     abortSession,
     loadOlderMessages,
+    revertToMessage,
+    unrevertSession,
   } = useSessions()
 
   // Derive sending state for this specific session
   const isSending = useSessions((s) => !!(currentSession && s.sending[currentSession.id]))
 
   const { authenticateForMessage } = useAuth()
-  const { client } = useConnections()
+  const { client, clientForDirectory } = useConnections()
+
+  // Use directory-aware client for sessions that belong to a project other than the active one
+  const sessionClient = useMemo(
+    () => (currentSession?.directory ? (clientForDirectory(currentSession.directory) ?? client) : client),
+    [currentSession?.directory, clientForDirectory, client],
+  )
 
   // Catalog
   const catalog = useCatalog()
@@ -117,6 +121,8 @@ export default function SessionScreen() {
   const agent = catalog.agent || ""
   const model = catalog.model
   const setModel = catalog.setModel
+  const variant = catalog.variant
+  const setVariant = catalog.setVariant
   const cycleAgent = catalog.cycleAgent
 
   // Permission & question state
@@ -127,12 +133,25 @@ export default function SessionScreen() {
   const shortDir = getShortDir(currentSession?.directory)
   const [showScrollButton, setShowScrollButton] = useState(false)
 
+  // SSE reconnect banner
+  const reconnectAttempts = useEvents((s) => s.reconnectAttempts)
+  const [showConnectedFlash, setShowConnectedFlash] = useState(false)
+  const prevReconnecting = useRef(false)
+
   // Voice input — transcript appends to the text input on completion
   const speech = useSpeech(
     useCallback((text: string) => {
       setInput((prev) => (prev ? prev + " " + text : text))
     }, []),
   )
+
+  // Surface speech recognition failures (e.g. mic permission denied). Keyed
+  // on the error value itself so it only fires once per distinct error, not
+  // on every re-render while it remains set.
+  useEffect(() => {
+    if (!speech.error) return
+    Alert.alert(t("session.alerts.speechErrorTitle"), t("session.alerts.speechErrorMessage"))
+  }, [speech.error, t])
 
   // Slash command state
   const slashActive = input.startsWith("/") && !input.includes(" ")
@@ -149,30 +168,112 @@ export default function SessionScreen() {
     return [...custom, ...BUILTIN_COMMANDS]
   }, [serverCommands])
 
+  // While a revert is pending, the reverted message and everything after it
+  // still exist server-side (cleanup only runs on the next prompt/unrevert)
+  // — hide them client-side so editing feels immediate. Message IDs are
+  // lexicographically sortable, same comparison the TUI uses. Optimistic
+  // "temp-" IDs (assigned client-side before the server responds, see
+  // sendMessage) aren't part of that sort order — always keep them so a
+  // message sent concurrently with a revert isn't hidden.
+  const revertMessageID = currentSession?.revert?.messageID
+
   // Inverted FlatList: data is reversed (newest first) so newest renders at bottom
   const messageData = useMemo(
     () =>
       (messages || [])
+        .filter((msg) => !revertMessageID || msg.id.startsWith("temp-") || msg.id < revertMessageID)
         .map((msg) => ({
           message: msg,
           parts: (parts && parts[msg.id]) || [],
         }))
         .reverse(),
-    [messages, parts],
+    [messages, parts, revertMessageID],
   )
+
+  // Tracks the latest composer text without pulling `input` into
+  // handleMessageLongPress's deps — kept as a plain ref assignment (not
+  // state) so the callback below stays referentially stable across
+  // keystrokes for MessageBubble's custom memo comparator.
+  const inputRef = useRef(input)
+  inputRef.current = input
+
+  const applyRevertResult = useCallback((result: Awaited<ReturnType<typeof revertToMessage>>) => {
+    if (!result.ok) {
+      if (result.reason === "unsupported") {
+        Alert.alert(t("session.alerts.notSupportedTitle"), t("session.alerts.notSupportedMessage"))
+      } else if (result.reason === "auth") {
+        Alert.alert(t("session.alerts.revertAuthFailedTitle"), t("session.alerts.revertAuthFailedMessage"))
+      } else {
+        Alert.alert(t("session.alerts.editFailedTitle"), t("session.alerts.editFailedMessage"))
+      }
+      return
+    }
+    setInput(result.text)
+    // Restore attachments in the same shape the composer's own picker
+    // functions (pickFromLibrary/pickFromCamera/pasteFromClipboard) use.
+    setAttachments(
+      result.files
+        .filter((f): f is typeof f & { url: string; mime: string } => !!f.url && !!f.mime)
+        .map((f) => ({ uri: f.url, mime: f.mime, filename: f.filename })),
+    )
+  }, [t])
+
+  // Stable across renders (reads fresh state via getState() rather than
+  // closing over props) so MessageBubble's custom memo comparator can bail
+  // safely without risking a stale handler.
+  const handleMessageLongPress = useCallback((messageID: string) => {
+    Alert.alert(t("session.alerts.messageActionsTitle"), undefined, [
+      { text: t("common.cancel"), style: "cancel" },
+      {
+        text: t("session.actions.editMessage"),
+        onPress: () => {
+          const doRevert = async () => {
+            const result = await useSessions.getState().revertToMessage(messageID)
+            applyRevertResult(result)
+          }
+          // Editing overwrites the composer — don't silently clobber an
+          // in-progress unsent draft.
+          if (inputRef.current.trim()) {
+            Alert.alert(
+              t("session.alerts.replaceDraftTitle"),
+              t("session.alerts.replaceDraftMessage"),
+              [
+                { text: t("common.cancel"), style: "cancel" },
+                { text: t("session.actions.replace"), style: "destructive", onPress: doRevert },
+              ],
+              { cancelable: false },
+            )
+            return
+          }
+          doRevert()
+        },
+      },
+    ])
+  }, [applyRevertResult, t])
 
   const scrollToBottom = useCallback((animated = true) => {
     flatListRef.current?.scrollToOffset({ offset: 0, animated })
   }, [])
 
-  useEffect(() => {
-    if (!id) return
-    selectSession(id, directory).then(() => {
-      // Re-fetch pending permissions/questions from the server to recover from
-      // missed SSE events or failed optimistic removals
-      if (client) refreshPending(client, id)
-    })
-  }, [id])
+  // Re-select on every focus, not just mount. currentSession/messages/
+  // permissions are a single global store, and the native stack keeps screens
+  // underneath a pushed one mounted. Without re-selecting on focus, navigating
+  // to another session and back would leave this screen bound to the *other*
+  // session's data (and its permission/question prompts) — so a user could
+  // approve the wrong session's tool call. useFocusEffect re-binds this screen
+  // to its own session whenever it becomes visible again.
+  useFocusEffect(
+    useCallback(() => {
+      if (!id) return
+      selectSession(id, directory).then(() => {
+        // Re-fetch pending permissions/questions from the server to recover from
+        // missed SSE events or failed optimistic removals
+        const connState = useConnections.getState()
+        const c = directory ? (connState.clientForDirectory(directory) ?? connState.client) : connState.client
+        if (c) refreshPending(c, id)
+      })
+    }, [id, directory]),
+  )
 
   // Sync model chip from latest assistant message
   useEffect(() => {
@@ -205,12 +306,6 @@ export default function SessionScreen() {
           case "agent":
             setInput("")
             cycleAgent()
-            return
-          case "compact":
-            setInput("")
-            return
-          case "clear":
-            setInput("")
             return
         }
       }
@@ -248,25 +343,39 @@ export default function SessionScreen() {
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ["images"],
       allowsMultipleSelection: true,
+      selectionLimit: 10,
       quality: 1, // full quality - we compress in manipulator
     })
     if (result.canceled) return
-    const items = await Promise.all(result.assets.map((a) => toJpeg(a.uri, a.width, a.height)))
-    setAttachments((prev) => [...prev, ...items])
-  }, [])
+    const settled = await Promise.allSettled(result.assets.map((a) => toJpeg(a.uri, a.width, a.height)))
+    const items = settled.filter((r) => r.status === "fulfilled").map((r) => r.value)
+    if (items.length) setAttachments((prev) => [...prev, ...items])
+    if (settled.some((r) => r.status === "rejected")) {
+      console.error(
+        "Failed to process image(s):",
+        settled.filter((r) => r.status === "rejected").map((r) => r.reason),
+      )
+      Alert.alert(t("session.alerts.imageFailedTitle"), t("session.alerts.imageFailedMessage"))
+    }
+  }, [t])
 
   const pickFromCamera = useCallback(async () => {
     const perm = await ImagePicker.requestCameraPermissionsAsync()
     if (!perm.granted) {
-      Alert.alert("Permission needed", "Camera access is required to take photos.")
+      Alert.alert(t("session.alerts.cameraPermissionTitle"), t("session.alerts.cameraPermissionMessage"))
       return
     }
     const result = await ImagePicker.launchCameraAsync({ quality: 1 })
     if (result.canceled) return
     const a = result.assets[0]
-    const item = await toJpeg(a.uri, a.width, a.height)
-    setAttachments((prev) => [...prev, item])
-  }, [])
+    try {
+      const item = await toJpeg(a.uri, a.width, a.height)
+      setAttachments((prev) => [...prev, item])
+    } catch (err) {
+      console.error("Failed to process photo:", err)
+      Alert.alert(t("session.alerts.imageFailedTitle"), t("session.alerts.imageFailedMessage"))
+    }
+  }, [t])
 
   const pasteFromClipboard = useCallback(async () => {
     // Try image first
@@ -275,16 +384,8 @@ export default function SessionScreen() {
       const img = await Clipboard.getImageAsync({ format: "png" })
       if (img?.data) {
         const uri = img.data.startsWith("data:") ? img.data : `data:image/png;base64,${img.data}`
-        setAttachments((prev) => [
-          ...prev,
-          {
-            uri,
-            mime: "image/png",
-            filename: "clipboard.png",
-            width: img.size.width,
-            height: img.size.height,
-          },
-        ])
+        const item = await toJpeg(uri, img.size.width, img.size.height)
+        setAttachments((prev) => [...prev, item])
         return
       }
     }
@@ -297,8 +398,8 @@ export default function SessionScreen() {
         return
       }
     }
-    Alert.alert("Empty clipboard", "Clipboard does not contain text or an image.")
-  }, [])
+    Alert.alert(t("session.alerts.emptyClipboardTitle"), t("session.alerts.emptyClipboardMessage"))
+  }, [t])
 
   const removeAttachment = useCallback((index: number) => {
     setAttachments((prev) => prev.filter((_, i) => i !== index))
@@ -308,7 +409,10 @@ export default function SessionScreen() {
   const handleSend = async () => {
     if (!input.trim() && attachments.length === 0) return
     const authenticated = await authenticateForMessage()
-    if (!authenticated) return
+    if (!authenticated) {
+      Alert.alert(t("session.alerts.authRequiredTitle"), t("session.alerts.authRequiredMessage"))
+      return
+    }
 
     const text = input.trim()
     const files = [...attachments]
@@ -320,8 +424,8 @@ export default function SessionScreen() {
       const [cmdName, ...args] = text.split(" ")
       const name = cmdName.slice(1)
       const match = serverCommands.find((c) => c.name === name)
-      if (match && client && currentSession) {
-        client.session
+      if (match && sessionClient && currentSession) {
+        sessionClient.session
           .command(currentSession.id, {
             command: name,
             arguments: args.join(" "),
@@ -335,7 +439,15 @@ export default function SessionScreen() {
 
     // Messages are queued server-side when the session is busy.
     // No need to abort - just send and it will be processed after current response.
-    await sendMessage(text, model || undefined, agent || undefined, files)
+    try {
+      await sendMessage(text, model || undefined, agent || undefined, files, variant || undefined)
+    } catch (err) {
+      console.error("Send failed:", err)
+      // Restore the user's text and attachments so their input isn't lost.
+      setInput((prev) => (prev ? prev : text))
+      setAttachments((prev) => (prev.length ? prev : files))
+      Alert.alert(t("session.alerts.sendFailedTitle"), t("session.alerts.sendFailedMessage"))
+    }
   }
 
   // In inverted mode, offset 0 = bottom. Show scroll button when scrolled away from bottom.
@@ -358,8 +470,21 @@ export default function SessionScreen() {
     if (!loadingMore) loadingTriggered.current = false
   }, [loadingMore])
 
+  // Detect reconnecting → stable transition for the "Connected ✓" flash.
+  // reconnectAttempts and lastDisconnectAt reset in the same set() call, so we
+  // can't use lastDisconnectAt alone; a useRef tracks the prior reconnecting state.
+  useEffect(() => {
+    const isReconnecting = reconnectAttempts > 0
+    if (prevReconnecting.current && !isReconnecting) {
+      setShowConnectedFlash(true)
+      const t = setTimeout(() => setShowConnectedFlash(false), 2000)
+      return () => clearTimeout(t)
+    }
+    prevReconnecting.current = isReconnecting
+  }, [reconnectAttempts])
+
   const handlePermissionReply = async (requestID: string, reply: "once" | "always" | "reject") => {
-    if (!client || !sessionID) return
+    if (!sessionClient || !sessionID) return
     // Snapshot for rollback
     const snapshot = useEvents.getState().permissions[sessionID] || []
     // Optimistically remove from UI
@@ -370,19 +495,19 @@ export default function SessionScreen() {
       },
     }))
     try {
-      await client.permission.reply(requestID, reply)
+      await sessionClient.permission.reply(requestID, reply)
     } catch (err) {
       console.error("Permission reply failed:", err)
       // Restore the prompt so the user can retry
       useEvents.setState((state) => ({
         permissions: { ...state.permissions, [sessionID]: snapshot },
       }))
-      Alert.alert("Reply Failed", "Could not send your response. Please try again.")
+      Alert.alert(t("session.alerts.replyFailedTitle"), t("session.alerts.replyFailedMessage"))
     }
   }
 
   const handleQuestionReply = async (requestID: string, answers: string[][]) => {
-    if (!client || !sessionID) return
+    if (!sessionClient || !sessionID) return
     const snapshot = useEvents.getState().questions[sessionID] || []
     useEvents.setState((state) => ({
       questions: {
@@ -391,18 +516,18 @@ export default function SessionScreen() {
       },
     }))
     try {
-      await client.question.reply(requestID, answers)
+      await sessionClient.question.reply(requestID, answers)
     } catch (err) {
       console.error("Question reply failed:", err)
       useEvents.setState((state) => ({
         questions: { ...state.questions, [sessionID]: snapshot },
       }))
-      Alert.alert("Reply Failed", "Could not send your response. Please try again.")
+      Alert.alert(t("session.alerts.replyFailedTitle"), t("session.alerts.replyFailedMessage"))
     }
   }
 
   const handleQuestionReject = async (requestID: string) => {
-    if (!client || !sessionID) return
+    if (!sessionClient || !sessionID) return
     const snapshot = useEvents.getState().questions[sessionID] || []
     useEvents.setState((state) => ({
       questions: {
@@ -411,13 +536,13 @@ export default function SessionScreen() {
       },
     }))
     try {
-      await client.question.reject(requestID)
+      await sessionClient.question.reject(requestID)
     } catch (err) {
       console.error("Question reject failed:", err)
       useEvents.setState((state) => ({
         questions: { ...state.questions, [sessionID]: snapshot },
       }))
-      Alert.alert("Reject Failed", "Could not send your response. Please try again.")
+      Alert.alert(t("session.alerts.rejectFailedTitle"), t("session.alerts.rejectFailedMessage"))
     }
   }
 
@@ -433,11 +558,19 @@ export default function SessionScreen() {
   const agentColor = currentAgent?.color || "#8b5cf6"
   const modelLabel = model?.modelID ? model.modelID.split("/").pop() || model.modelID : "default"
 
+  // Variants for current model (for reasoning effort picker)
+  const currentModelVariants = useMemo(() => {
+    if (!model) return undefined
+    const provider = providers.find((p) => p.id === model.providerID)
+    const found = provider?.models.find((m) => m.id === model.modelID)
+    return found?.variants
+  }, [model, providers])
+
   return (
     <>
       <Stack.Screen
         options={{
-          title: currentSession?.title || "Session",
+          title: currentSession?.title || t("session.titleFallback"),
           headerRight: () => (
             <View style={s.headerRight}>
               {shortDir && (
@@ -460,8 +593,20 @@ export default function SessionScreen() {
 
       <KeyboardAvoidingView
         style={[s.container, isDark && s.containerDark]}
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 140 : 100}
+        // Both platforms use "padding" so the composer/toolbar is pushed up
+        // above the keyboard via JS-measured keyboard height.
+        //
+        // Android previously relied on the native android:windowSoftInputMode
+        // (adjustResize, see AndroidManifest.xml) with behavior={undefined}
+        // to let the OS resize the window (see #70/#53). Since adopting
+        // Expo's mandatory edge-to-edge display, Android no longer resizes
+        // the window when the keyboard opens — the system assumes insets are
+        // handled dynamically — so adjustResize became a no-op and the
+        // bottom toolbar + input were left completely hidden behind the
+        // keyboard (#147). "padding" restores avoidance without depending
+        // on native resize.
+        behavior="padding"
+        keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
       >
         {/* Session info pulldown */}
         <SessionInfo
@@ -481,6 +626,39 @@ export default function SessionScreen() {
           onClose={() => setShowInfo(false)}
         />
 
+        {/* SSE reconnect/connected banner */}
+        {reconnectAttempts > 0 && (
+          <View style={[s.banner, s.bannerReconnecting]}>
+            <Text style={s.bannerText}>{t("session.banners.reconnecting", { attempt: reconnectAttempts })}</Text>
+          </View>
+        )}
+        {showConnectedFlash && reconnectAttempts === 0 && (
+          <View style={[s.banner, s.bannerConnected]}>
+            <Text style={s.bannerText}>{t("session.banners.connected")}</Text>
+          </View>
+        )}
+
+        {/* Pending revert (from "Edit message") — offer a way back before it's
+            cleaned up by the next prompt. */}
+        {revertMessageID && (
+          <View style={[s.banner, s.bannerRevert]}>
+            <Text style={s.bannerText}>{t("session.banners.reverted")}</Text>
+            <TouchableOpacity
+              onPress={() => {
+                unrevertSession()
+                // The composer was prefilled with the reverted message's text/
+                // attachments (see applyRevertResult) — clear it so Undo doesn't
+                // leave a stale draft that could be sent as a duplicate.
+                setInput("")
+                setAttachments([])
+              }}
+              hitSlop={8}
+            >
+              <Text style={s.bannerAction}>{t("session.banners.undo")}</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
         {isLoading ? (
           <View style={s.loading}>
             <ActivityIndicator size="large" color={isDark ? "#ffffff" : "#0a0a0a"} />
@@ -492,7 +670,14 @@ export default function SessionScreen() {
               data={messageData}
               inverted
               keyExtractor={(item) => item.message.id}
-              renderItem={({ item }) => <MessageBubble message={item.message} parts={item.parts} isDark={isDark} />}
+              renderItem={({ item }) => (
+                <MessageBubble
+                  message={item.message}
+                  parts={item.parts}
+                  isDark={isDark}
+                  onLongPress={handleMessageLongPress}
+                />
+              )}
               contentContainerStyle={s.messageList}
               onScroll={handleScroll}
               scrollEventThrottle={100}
@@ -504,18 +689,20 @@ export default function SessionScreen() {
                 loadingMore ? (
                   <View style={s.loadingMore}>
                     <ActivityIndicator size="small" color={isDark ? "#888888" : "#666666"} />
-                    <Text style={[s.loadingMoreText, isDark && s.metaDark]}>Loading older messages...</Text>
+                    <Text style={[s.loadingMoreText, isDark && s.metaDark]}>{t("session.loadingOlder")}</Text>
                   </View>
                 ) : null
               }
-              ListEmptyComponent={
-                <View style={s.emptyInverted}>
-                  <Ionicons name="chatbubble-outline" size={48} color={isDark ? "#444444" : "#cccccc"} />
-                  <Text style={[s.emptyText, isDark && s.metaDark]}>Start a conversation</Text>
-                  <Text style={[s.emptyHint, isDark && s.metaDark]}>Type / for commands</Text>
-                </View>
-              }
             />
+            {/* Empty state rendered OUTSIDE the inverted list to avoid the
+                inverted transform mirroring its text/icon (see #ui-mirror). */}
+            {messageData.length === 0 && (
+              <View style={s.emptyOverlay} pointerEvents="none">
+                <Ionicons name="chatbubble-outline" size={48} color={isDark ? "#444444" : "#cccccc"} />
+                <Text style={[s.emptyText, isDark && s.metaDark]}>{t("session.empty.title")}</Text>
+                <Text style={[s.emptyHint, isDark && s.metaDark]}>{t("session.empty.hint")}</Text>
+              </View>
+            )}
             {showScrollButton && (
               <TouchableOpacity style={[s.scrollBtn, isDark && s.scrollBtnDark]} onPress={() => scrollToBottom(true)}>
                 <Ionicons name="chevron-down" size={24} color={isDark ? "#ffffff" : "#0a0a0a"} />
@@ -568,12 +755,26 @@ export default function SessionScreen() {
           <TouchableOpacity
             style={[s.modelChip, isDark && s.modelChipDark]}
             onPress={() => modelSheetRef.current?.expand()}
+            testID="model-chip"
           >
             <Ionicons name="hardware-chip-outline" size={14} color={isDark ? "#888888" : "#666666"} />
             <Text style={[s.modelLabel, isDark && s.metaDark]} numberOfLines={1}>
               {modelLabel}
             </Text>
           </TouchableOpacity>
+
+          {currentModelVariants && Object.keys(currentModelVariants).length > 0 && (
+            <TouchableOpacity
+              style={[s.variantChip, isDark && s.variantChipDark, variant && s.variantChipActive]}
+              onPress={() => variantSheetRef.current?.expand()}
+              testID="variant-chip"
+            >
+              <Ionicons name="flash-outline" size={14} color={variant ? "#8b5cf6" : isDark ? "#888888" : "#666666"} />
+              <Text style={[s.variantLabel, isDark && s.metaDark, variant && s.variantLabelActive]} numberOfLines={1}>
+                {variant ? variant.charAt(0).toUpperCase() + variant.slice(1) : t("session.toolbar.auto")}
+              </Text>
+            </TouchableOpacity>
+          )}
         </View>
 
         {/* Attachment preview */}
@@ -596,13 +797,20 @@ export default function SessionScreen() {
 
             <TextInput
               style={[s.input, isDark && s.inputDark, speech.listening && s.inputListening]}
-              placeholder={speech.listening ? "Listening..." : isSending ? "Send a follow-up..." : "Type a message..."}
+              placeholder={
+                speech.listening
+                  ? t("session.input.placeholderListening")
+                  : isSending
+                    ? t("session.input.placeholderFollowUp")
+                    : t("session.input.placeholderDefault")
+              }
               placeholderTextColor={speech.listening ? "#ef4444" : isDark ? "#666666" : "#999999"}
               value={speech.listening ? speech.transcript : input}
               onChangeText={speech.listening ? undefined : setInput}
               editable={!speech.listening}
               multiline
               maxLength={10000}
+              testID="chat-message-input"
             />
             {/* Stop button: only when busy and no input */}
             {isSending && !input.trim() && attachments.length === 0 && !speech.listening && (
@@ -624,7 +832,7 @@ export default function SessionScreen() {
             )}
             {/* Send button: when there's input */}
             {!speech.listening && (input.trim() || attachments.length > 0) && (
-              <TouchableOpacity style={s.sendBtn} onPress={handleSend}>
+              <TouchableOpacity style={s.sendBtn} onPress={handleSend} testID="chat-send-button">
                 <Ionicons name="send" size={20} color="#ffffff" />
               </TouchableOpacity>
             )}
@@ -639,6 +847,15 @@ export default function SessionScreen() {
         selected={model}
         isDark={isDark}
         onSelect={handleModelSelect}
+      />
+
+      {/* Reasoning effort (variant) picker bottom sheet */}
+      <VariantPicker
+        sheetRef={variantSheetRef}
+        variants={currentModelVariants}
+        selected={variant}
+        isDark={isDark}
+        onSelect={setVariant}
       />
     </>
   )
@@ -682,13 +899,13 @@ const s = StyleSheet.create({
   },
   loadingMoreText: { fontSize: 13, color: "#999999" },
 
-  // Empty (inverted list flips content, so use transform to un-flip)
-  emptyInverted: {
-    flex: 1,
+  // Empty state overlay — sits on top of the (empty) inverted list, untransformed,
+  // so its text/icon render upright and un-mirrored on Android.
+  emptyOverlay: {
+    ...StyleSheet.absoluteFillObject,
     justifyContent: "center",
     alignItems: "center",
     paddingVertical: 64,
-    transform: [{ scaleY: -1 }],
   },
 
   // Empty
@@ -732,6 +949,21 @@ const s = StyleSheet.create({
   },
   modelChipDark: { backgroundColor: "#1a1a1a" },
   modelLabel: { fontSize: 12, color: "#666666", maxWidth: 160 },
+
+  // Variant (reasoning effort) chip
+  variantChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "#f5f5f5",
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  variantChipDark: { backgroundColor: "#1a1a1a" },
+  variantChipActive: { backgroundColor: "#f5f3ff" },
+  variantLabel: { fontSize: 12, color: "#666666" },
+  variantLabelActive: { color: "#8b5cf6" },
 
   // Input
   inputContainer: {
@@ -814,4 +1046,22 @@ const s = StyleSheet.create({
   dirBadgeDark: { backgroundColor: "#1a1a1a" },
   dirText: { fontSize: 12, color: "#666666", fontWeight: "500" },
   dirTextDark: { color: "#888888" },
+
+  // SSE reconnect/connected banner
+  banner: {
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    alignItems: "center",
+  },
+  bannerReconnecting: { backgroundColor: "#92400e" },
+  bannerConnected: { backgroundColor: "#065f46" },
+  bannerText: { color: "#ffffff", fontSize: 13, fontWeight: "500" },
+
+  // Pending revert (edit message) banner
+  bannerRevert: {
+    backgroundColor: "#1e3a8a",
+    flexDirection: "row",
+    justifyContent: "space-between",
+  },
+  bannerAction: { color: "#93c5fd", fontSize: 13, fontWeight: "700" },
 })

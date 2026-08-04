@@ -1,6 +1,7 @@
 import { create } from "zustand"
 import { useConnections } from "./connections"
 import type { Agent, Command } from "../lib/sdk"
+import { chooseModelSelection } from "../lib/model-selection"
 
 export interface ProviderModel {
   id: string
@@ -8,6 +9,7 @@ export interface ProviderModel {
   reasoning: boolean
   attachment: boolean
   limit?: { context: number; output: number }
+  variants?: Record<string, { reasoningEffort?: string }>
 }
 
 export interface Provider {
@@ -22,6 +24,10 @@ interface ModelSelection {
   modelID: string
 }
 
+function sameModel(left: ModelSelection | null, right: ModelSelection | null) {
+  return left?.providerID === right?.providerID && left?.modelID === right?.modelID
+}
+
 interface CatalogState {
   agents: Agent[]
   commands: Command[]
@@ -30,12 +36,14 @@ interface CatalogState {
   // Current selections
   agent: string // agent name, e.g. "build"
   model: ModelSelection | null
+  variant: string | null // model variant for reasoning effort (e.g. "low", "medium", "high")
   loaded: boolean
 
   // Actions
   load: () => Promise<void>
   setAgent: (name: string) => void
   setModel: (selection: ModelSelection | null) => void
+  setVariant: (variant: string | null) => void
   cycleAgent: (direction?: 1 | -1) => void
 }
 
@@ -46,6 +54,7 @@ export const useCatalog = create<CatalogState>((set, get) => ({
   defaults: {},
   agent: "",
   model: null,
+  variant: null,
   loaded: false,
 
   load: async () => {
@@ -80,20 +89,11 @@ export const useCatalog = create<CatalogState>((set, get) => ({
                 reasoning: m.reasoning ?? false,
                 attachment: m.attachment ?? false,
                 limit: m.limit,
+                variants: m.variants,
               })),
           }))
           .filter((p) => p.models.length > 0)
       : []
-
-    console.log(
-      "[catalog] loaded:",
-      agents.length,
-      "agents,",
-      commands.length,
-      "commands,",
-      providers.length,
-      "providers (" + providers.reduce((n, p) => n + p.models.length, 0) + " models)",
-    )
 
     // Filter out hidden agents
     const visible = agents.filter((a) => !a.hidden)
@@ -102,31 +102,47 @@ export const useCatalog = create<CatalogState>((set, get) => ({
     const current = get().agent
     const agent = current && visible.some((a) => a.name === current) ? current : visible[0]?.name || "build"
 
-    // Default model: use default agent's model, or first connected provider's default model
+    // Default model: keep valid existing selection; otherwise prefer connected
+    // provider defaults, then first connected model; agent model is last fallback.
     const existing = get().model
-    const fallback = (() => {
-      const defaultAgent = visible[0]
-      if (defaultAgent?.model) return defaultAgent.model
-      for (const p of providers) {
-        const defaultModelID = defaults[p.id]
-        const match = defaultModelID ? p.models.find((m) => m.id === defaultModelID) : p.models[0]
-        if (match) return { providerID: p.id, modelID: match.id }
-      }
-      return null
-    })()
-    const model = existing || fallback
+    const defaultAgent = visible[0]
+    const model = chooseModelSelection({
+      providers,
+      defaults,
+      existing,
+      agentModel: defaultAgent?.model || null,
+    })
 
-    set({ agents: visible, commands, providers, defaults, agent, model, loaded: true })
+    set((state) => ({
+      agents: visible,
+      commands,
+      providers,
+      defaults,
+      agent,
+      model,
+      variant: sameModel(state.model, model) ? state.variant : null,
+      loaded: true,
+    }))
   },
 
   setAgent: (name) => {
     const match = get().agents.find((a) => a.name === name)
     if (!match) return
     const model = match.model || get().model
-    set({ agent: name, model })
+    set((state) => ({
+      agent: name,
+      model,
+      variant: sameModel(state.model, model) ? state.variant : null,
+    }))
   },
 
-  setModel: (selection) => set({ model: selection }),
+  setModel: (selection) =>
+    set((state) => ({
+      model: selection,
+      variant: sameModel(state.model, selection) ? state.variant : null,
+    })),
+
+  setVariant: (variant) => set({ variant }),
 
   cycleAgent: (direction = 1) => {
     const { agents, agent } = get()

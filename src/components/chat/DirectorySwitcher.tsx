@@ -2,6 +2,7 @@ import { useState, useCallback, useMemo } from "react"
 import { View, Text, TouchableOpacity, StyleSheet } from "react-native"
 import { Ionicons } from "@expo/vector-icons"
 import BottomSheet, { BottomSheetBackdrop, BottomSheetFlatList, BottomSheetTextInput } from "@gorhom/bottom-sheet"
+import { useTranslation } from "react-i18next"
 
 interface Props {
   sheetRef: React.RefObject<BottomSheet | null>
@@ -10,9 +11,13 @@ interface Props {
   serverHome: string | null
   isDark: boolean
   onSwitch: (directory?: string) => void
+  // Opens a browsable folder picker rooted at the server's filesystem, as an
+  // alternative to typing a path. Optional so existing callers keep working.
+  onBrowse?: () => void
 }
 
-export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDark, onSwitch }: Props) {
+export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDark, onSwitch, onBrowse }: Props) {
+  const { t } = useTranslation()
   const [custom, setCustom] = useState("")
 
   const handleSelect = useCallback(
@@ -33,7 +38,7 @@ export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDa
   // Build list: server default + recents (excluding current)
   const items = useMemo(() => {
     const list: Array<{ label: string; dir?: string; active: boolean }> = [
-      { label: "Server Default", dir: undefined, active: !current },
+      { label: t("chat.directorySwitcher.serverDefaultLabel"), dir: undefined, active: !current },
     ]
     for (const dir of recents) {
       if (dir === current) continue
@@ -41,7 +46,7 @@ export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDa
       list.push({ label: short, dir, active: false })
     }
     return list
-  }, [recents, current])
+  }, [recents, current, t])
 
   const shortCurrent = current ? current.split("/").filter(Boolean).pop() || current : null
 
@@ -50,6 +55,9 @@ export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDa
       ref={sheetRef}
       index={-1}
       snapPoints={["45%", "70%"]}
+      // See DirectoryBrowserSheet.tsx for why this is required alongside
+      // static snapPoints (issue #104): without it the sheet can never open.
+      enableDynamicSizing={false}
       enablePanDownToClose
       keyboardBehavior="interactive"
       keyboardBlurBehavior="restore"
@@ -64,7 +72,7 @@ export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDa
       }}
     >
       <View style={s.header}>
-        <Text style={[s.title, isDark && s.white]}>Switch Project</Text>
+        <Text style={[s.title, isDark && s.white]}>{t("chat.directorySwitcher.title")}</Text>
         {shortCurrent && (
           <View style={s.current}>
             <Ionicons name="folder" size={14} color="#8b5cf6" />
@@ -100,14 +108,30 @@ export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDa
       </View>
 
       {/* Quick path chips */}
-      {serverHome && (
+      {(serverHome || onBrowse) && (
         <View style={s.chips}>
-          <TouchableOpacity style={[s.chip, isDark && s.chipDark]} onPress={() => setCustom(serverHome)}>
-            <Text style={[s.chipText, isDark && s.chipTextDark]}>~</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[s.chip, isDark && s.chipDark]} onPress={() => setCustom(serverHome + "/")}>
-            <Text style={[s.chipText, isDark && s.chipTextDark]}>~/</Text>
-          </TouchableOpacity>
+          {serverHome && (
+            <>
+              <TouchableOpacity style={[s.chip, isDark && s.chipDark]} onPress={() => setCustom(serverHome)}>
+                <Text style={[s.chipText, isDark && s.chipTextDark]}>~</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[s.chip, isDark && s.chipDark]} onPress={() => setCustom(serverHome + "/")}>
+                <Text style={[s.chipText, isDark && s.chipTextDark]}>~/</Text>
+              </TouchableOpacity>
+            </>
+          )}
+          {onBrowse && (
+            <TouchableOpacity
+              style={[s.chip, s.chipBrowse, isDark && s.chipDark]}
+              onPress={() => {
+                sheetRef.current?.close()
+                onBrowse()
+              }}
+            >
+              <Ionicons name="folder-open-outline" size={14} color={isDark ? "#8b5cf6" : "#6d28d9"} />
+              <Text style={[s.chipText, isDark && s.chipTextDark]}>{t("chat.directorySwitcher.browseLabel")}</Text>
+            </TouchableOpacity>
+          )}
         </View>
       )}
 
@@ -136,14 +160,18 @@ export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDa
                   {item.dir}
                 </Text>
               )}
-              {!item.dir && <Text style={[s.rowPath, isDark && s.dimDark]}>Uses server's working directory</Text>}
+              {!item.dir && (
+                <Text style={[s.rowPath, isDark && s.dimDark]}>{t("chat.directorySwitcher.usesServerDir")}</Text>
+              )}
             </View>
             {item.active && <Ionicons name="checkmark-circle" size={20} color="#8b5cf6" />}
           </TouchableOpacity>
         )}
         contentContainerStyle={s.list}
         ListHeaderComponent={
-          items.length > 1 ? <Text style={[s.section, isDark && s.dimDark]}>Recent Projects</Text> : null
+          items.length > 1 ? (
+            <Text style={[s.section, isDark && s.dimDark]}>{t("chat.directorySwitcher.recentProjectsLabel")}</Text>
+          ) : null
         }
       />
     </BottomSheet>
@@ -187,6 +215,11 @@ const s = StyleSheet.create({
   },
   chipDark: {
     backgroundColor: "#2a2040",
+  },
+  chipBrowse: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
   },
   chipText: {
     fontSize: 13,

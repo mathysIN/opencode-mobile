@@ -16,12 +16,16 @@ interface Props {
   message: Message
   parts: Part[]
   isDark: boolean
+  // Only wired up for user messages — long-press opens the "Edit message" /
+  // revert action sheet. Identified by messageID (not a closure over parts)
+  // so it stays correct even if the memo below bails on a stale render.
+  onLongPress?: (messageID: string) => void
 }
 
 // TODO: Replace with streamdown-rn once React 19 types PR lands - it has
 // built-in block-level memoization that eliminates re-renders for stable blocks
 export const MessageBubble = memo(
-  function MessageBubble({ message, parts, isDark }: Props) {
+  function MessageBubble({ message, parts, isDark, onLongPress }: Props) {
     const isUser = message.role === "user"
 
     const textParts = parts.filter((p) => p.type === "text")
@@ -32,13 +36,17 @@ export const MessageBubble = memo(
     const reasoning = reasoningParts.map((p) => p.text).join("\n") || ""
 
     return (
-      <View
+      <TouchableOpacity
+        activeOpacity={isUser && onLongPress ? 0.7 : 1}
+        onLongPress={isUser && onLongPress ? () => onLongPress(message.id) : undefined}
+        disabled={!isUser || !onLongPress}
         style={[
           s.bubble,
           isUser ? s.user : s.assistant,
           isUser && isDark && s.userDark,
           !isUser && isDark && s.assistantDark,
         ]}
+        testID={`chat-bubble-${message.role}`}
       >
         {/* Role indicator */}
         <View style={s.header}>
@@ -100,21 +108,24 @@ export const MessageBubble = memo(
             {message.cost ? ` · $${message.cost.toFixed(4)}` : ""}
           </Text>
         )}
-      </View>
+      </TouchableOpacity>
     )
   },
   (prev, next) => {
     // Only re-render if message content actually changed
-    // This prevents completed messages from re-rendering during streaming
-    if (prev.message.id !== next.message.id) return false
+    // This prevents completed messages from re-rendering during streaming.
+    // The store replaces changed parts/messages with NEW object references,
+    // so a reference-equality sweep over every part catches every real change
+    // (including tool parts, which have no `.text`) while still skipping
+    // unchanged (completed) messages during other messages' streaming.
+    if (prev.message !== next.message) return false
     if (prev.isDark !== next.isDark) return false
+    if (prev.onLongPress !== next.onLongPress) return false
     if (prev.parts.length !== next.parts.length) return false
-    // Compare the last part's text content - this is what changes during streaming
-    const prevLast = prev.parts[prev.parts.length - 1]
-    const nextLast = next.parts[next.parts.length - 1]
-    if (!prevLast && !nextLast) return true
-    if (!prevLast || !nextLast) return false
-    return prevLast.type === nextLast.type && prevLast.text === nextLast.text
+    for (let i = 0; i < prev.parts.length; i++) {
+      if (prev.parts[i] !== next.parts[i]) return false
+    }
+    return true
   },
 )
 

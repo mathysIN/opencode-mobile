@@ -1,12 +1,23 @@
 import { create } from "zustand"
 import * as SecureStore from "expo-secure-store"
+import * as Crypto from "expo-crypto"
 import type { ServerConnection, ConnectionType } from "../lib/types"
 import { createClient, type Client, type Project } from "../lib/sdk"
+import { addBreadcrumb } from "../lib/sentry"
+import { AnalyticsEvent, classifyConnectionError, track, type ConnectionTestSource } from "../lib/analytics"
+import { buildAuth } from "../lib/auth"
+import { stripTrailingSlash } from "../lib/path-utils"
 
 const CONNECTIONS_KEY = "opencode_connections"
 const PASSWORDS_PREFIX = "opencode_password_"
 const RECENT_DIRS_KEY = "opencode_recent_dirs"
 const MAX_RECENT_DIRS = 10
+// A bad IP (unreachable host, wrong port) otherwise hangs for the full 30s
+// general request timeout before the user sees a "connection failed" error —
+// a first-run bounce driver. The interactive connect flow can afford to fail
+// faster since a real server responds to /global/health in well under a
+// second; this does NOT affect the timeout used for real session traffic.
+const CONNECTION_TEST_TIMEOUT_MS = 12_000
 
 // Cached auth so we can create directory-scoped clients without async SecureStore lookups
 interface ClientBase {
@@ -30,11 +41,18 @@ interface ConnectionsState {
   addConnection: (connection: Omit<ServerConnection, "id">, password?: string) => Promise<void>
   removeConnection: (id: string) => Promise<void>
   setActiveConnection: (id: string) => Promise<void>
-  testConnection: (connection: ServerConnection, password?: string) => Promise<boolean>
-  updateConnection: (id: string, updates: Partial<ServerConnection>) => Promise<void>
+  // `source` distinguishes the activation funnel (onboarding) from the edit
+  // screen's Test button (edit_test) in analytics.
+  testConnection: (
+    connection: ServerConnection,
+    source: ConnectionTestSource,
+    password?: string,
+  ) => Promise<{ ok: boolean; error?: string }>
+  updateConnection: (id: string, updates: Partial<ServerConnection>, password?: string) => Promise<void>
   refreshProject: () => Promise<void>
-  // Create a one-off client pointing at a specific directory (for cross-project operations)
-  clientForDirectory: (directory: string) => Client | null
+  // Create a one-off client pointing at a specific directory (for cross-project operations).
+  // Pass undefined to get a directory-less client that queries the server without project scope.
+  clientForDirectory: (directory?: string) => Client | null
   // Switch the active connection's directory and reload
   switchDirectory: (directory?: string) => Promise<void>
   // Record a directory as recently used
@@ -42,7 +60,7 @@ interface ConnectionsState {
 }
 
 function generateId(): string {
-  return Math.random().toString(36).slice(2, 11)
+  return Crypto.randomUUID().replace(/-/g, "").slice(0, 16)
 }
 
 function buildClient(
@@ -86,7 +104,7 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
       let home: string | null = null
       if (active) {
         const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${active.id}`)
-        const auth = active.username && password ? { username: active.username, password } : undefined
+        const auth = buildAuth(active.username, password)
         const built = buildClient(active.url, active.directory, auth)
         client = built.client
         base = built.base
@@ -140,15 +158,31 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
     let base = get().clientBase
     let activeConnection = get().activeConnection
 
+    let project = get().currentProject
+    let serverHome = get().serverHome
+
     if (newConnection.active) {
       activeConnection = newConnection
-      const auth = newConnection.username && password ? { username: newConnection.username, password } : undefined
+      const auth = buildAuth(newConnection.username, password)
       const built = buildClient(newConnection.url, newConnection.directory, auth)
       client = built.client
       base = built.base
+
+      // Fetch server metadata so loadSessions can use clientForDirectory(serverHome)
+      // immediately after the connection is added (same as setActiveConnection does).
+      try {
+        const [proj, paths] = await Promise.all([
+          client.project.current().catch(() => null),
+          client.path.get().catch(() => null),
+        ])
+        project = proj
+        serverHome = paths?.home || null
+      } catch {
+        // Server might be unreachable; proceed without metadata
+      }
     }
 
-    set({ connections, activeConnection, client, clientBase: base })
+    set({ connections, activeConnection, client, clientBase: base, currentProject: project, serverHome })
   },
 
   removeConnection: async (id) => {
@@ -167,7 +201,7 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
         newActive.active = true
         await SecureStore.setItemAsync(CONNECTIONS_KEY, JSON.stringify(connections))
         const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${newActive.id}`)
-        const auth = newActive.username && password ? { username: newActive.username, password } : undefined
+        const auth = buildAuth(newActive.username, password)
         const built = buildClient(newActive.url, newActive.directory, auth)
         set({ connections, activeConnection: newActive, client: built.client, clientBase: built.base })
       } else {
@@ -194,7 +228,7 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
 
     if (active) {
       const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${active.id}`)
-      const auth = active.username && password ? { username: active.username, password } : undefined
+      const auth = buildAuth(active.username, password)
       const built = buildClient(active.url, active.directory, auth)
       client = built.client
       base = built.base
@@ -216,33 +250,50 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
     }
 
     set({ connections, activeConnection: active, client, clientBase: base, currentProject: project, serverHome: home })
+    addBreadcrumb({
+      category: "connection",
+      message: active ? `active connection set: ${active.type}` : "active connection cleared",
+      data: { id: active?.id, type: active?.type, hasProject: Boolean(project) },
+    })
   },
 
-  testConnection: async (connection, password) => {
+  testConnection: async (connection, source, password) => {
+    track(AnalyticsEvent.ConnectionAttempted, { source })
     try {
       const client = createClient({
         baseUrl: connection.url,
         directory: connection.directory,
-        auth: connection.username && password ? { username: connection.username, password } : undefined,
+        auth: buildAuth(connection.username, password),
       })
 
-      await client.global.health()
-      return true
-    } catch {
-      return false
+      await client.global.health(CONNECTION_TEST_TIMEOUT_MS)
+      track(AnalyticsEvent.ConnectionSucceeded, { source })
+      return { ok: true }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      track(AnalyticsEvent.ConnectionFailed, { source, error_class: classifyConnectionError(message) })
+      return { ok: false, error: message }
     }
   },
 
-  updateConnection: async (id, updates) => {
+  updateConnection: async (id, updates, password) => {
     const connections = get().connections.map((c) => (c.id === id ? { ...c, ...updates } : c))
 
     await SecureStore.setItemAsync(CONNECTIONS_KEY, JSON.stringify(connections))
+
+    // Persist a new password only when one was entered. The edit form loads the
+    // password field blank (passwords aren't read back for security), so an
+    // empty value means "keep the existing password", not "clear it". Written
+    // before the active-client rebuild below so the rebuilt client picks it up.
+    if (password) {
+      await SecureStore.setItemAsync(`${PASSWORDS_PREFIX}${id}`, password)
+    }
 
     // If updating active connection, recreate client
     if (get().activeConnection?.id === id) {
       const active = connections.find((c) => c.id === id)!
       const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${id}`)
-      const auth = active.username && password ? { username: active.username, password } : undefined
+      const auth = buildAuth(active.username, password)
       const built = buildClient(active.url, active.directory, auth)
       try {
         const [project, paths] = await Promise.all([
@@ -295,8 +346,11 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
   switchDirectory: async (directory) => {
     const active = get().activeConnection
     if (!active) return
-    // Update connection directory and recreate client
-    const dir = directory?.trim() || undefined
+    // Update connection directory and recreate client. Normalize trailing
+    // slashes so "/home/user" and "/home/user/" don't diverge (recent-dir
+    // duplicates + a mismatched "current directory" highlight).
+    const trimmed = directory?.trim()
+    const dir = trimmed ? stripTrailingSlash(trimmed) : undefined
     await get().updateConnection(active.id, { directory: dir })
     // Record in recents if it's a real directory
     if (dir) await get().addRecentDirectory(dir)
@@ -304,6 +358,9 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
 
   addRecentDirectory: async (directory) => {
     const current = get().recentDirectories
+    // Normalize trailing slashes so the same dir entered as ".../x" and
+    // ".../x/" dedups to one recent-list entry instead of two.
+    directory = stripTrailingSlash(directory.trim())
     // Move to front, dedup, cap at MAX
     const updated = [directory, ...current.filter((d) => d !== directory)].slice(0, MAX_RECENT_DIRS)
     set({ recentDirectories: updated })

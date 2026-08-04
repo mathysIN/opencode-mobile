@@ -12,23 +12,33 @@ import {
 } from "react-native"
 import { router, useLocalSearchParams } from "expo-router"
 import { Ionicons } from "@expo/vector-icons"
+import { useTranslation } from "react-i18next"
 import { useConnections } from "../../src/stores/connections"
+import { useEvents } from "../../src/stores/events"
 import type { ConnectionType } from "../../src/lib/types"
+import { probeConnection, shareReport } from "../../src/lib/diagnostics"
+import { captureDiagnostic } from "../../src/lib/sentry"
+import { parseUrl } from "../../src/lib/diagnostics-classify"
+import { buildAuth } from "../../src/lib/auth"
 
+// labelKey (not literal text): this is a module-level constant evaluated
+// before i18next is guaranteed ready, so the label is resolved with t() at
+// render time — same pattern as categoryMeta in src/lib/notifications.ts.
 const CONNECTION_TYPES: Array<{
   type: ConnectionType
-  label: string
+  labelKey: string
   icon: keyof typeof Ionicons.glyphMap
 }> = [
-  { type: "local", label: "Local", icon: "wifi" },
-  { type: "tunnel", label: "Tunnel", icon: "globe" },
-  { type: "cloud", label: "Cloud", icon: "cloud" },
+  { type: "local", labelKey: "connection.shared.types.local", icon: "wifi" },
+  { type: "tunnel", labelKey: "connection.shared.types.tunnel", icon: "globe" },
+  { type: "cloud", labelKey: "connection.shared.types.cloud", icon: "cloud" },
 ]
 
 export default function EditConnectionScreen() {
   const { id } = useLocalSearchParams<{ id: string }>()
   const colorScheme = useColorScheme()
   const isDark = colorScheme === "dark"
+  const { t } = useTranslation()
 
   const { connections, updateConnection, removeConnection, testConnection } = useConnections()
 
@@ -56,19 +66,23 @@ export default function EditConnectionScreen() {
   if (!connection) {
     return (
       <View style={[styles.container, isDark && styles.containerDark, styles.center]}>
-        <Text style={[styles.errorText, isDark && styles.textDark]}>Connection not found</Text>
+        <Text style={[styles.errorText, isDark && styles.textDark]}>{t("connection.edit.notFound")}</Text>
       </View>
     )
   }
 
   const handleTest = async () => {
     if (!url.trim()) {
-      Alert.alert("Error", "Please enter a server URL")
+      Alert.alert(t("common.error"), t("connection.shared.alerts.enterUrl"))
+      return
+    }
+    if (!parseUrl(url).valid) {
+      Alert.alert(t("connection.shared.alerts.invalidUrlTitle"), t("connection.shared.alerts.invalidUrlMessage"))
       return
     }
 
     setIsTesting(true)
-    const success = await testConnection(
+    const result = await testConnection(
       {
         id: connection.id,
         name: name || "Test",
@@ -77,43 +91,86 @@ export default function EditConnectionScreen() {
         directory: directory.trim() || undefined,
         username: username.trim() || undefined,
       },
+      "edit_test",
       password || undefined,
     )
+
+    if (result.ok) {
+      setIsTesting(false)
+      Alert.alert(t("connection.edit.alerts.successTitle"), t("connection.edit.alerts.successMessage"))
+      return
+    }
+
+    // Failed: run active diagnostics, capture to Sentry, offer a shareable report.
+    const report = await probeConnection(url.trim(), buildAuth(username, password))
+    captureDiagnostic(report)
     setIsTesting(false)
 
     Alert.alert(
-      success ? "Success" : "Failed",
-      success ? "Connection successful!" : "Could not connect to the server. Check the URL and credentials.",
+      t("connection.shared.alerts.connectionFailedTitle"),
+      t("connection.edit.alerts.connectionFailedMessage", {
+        summary: report.summary,
+        detail: result.error || t("connection.edit.alerts.noDetail"),
+      }),
+      [
+        { text: t("common.ok"), style: "cancel" },
+        { text: t("common.shareReport"), onPress: () => shareReport(report) },
+      ],
     )
   }
 
   const handleSave = async () => {
     if (!name.trim()) {
-      Alert.alert("Error", "Please enter a connection name")
+      Alert.alert(t("common.error"), t("connection.shared.alerts.enterName"))
       return
     }
     if (!url.trim()) {
-      Alert.alert("Error", "Please enter a server URL")
+      Alert.alert(t("common.error"), t("connection.shared.alerts.enterUrl"))
+      return
+    }
+    if (!parseUrl(url).valid) {
+      Alert.alert(t("connection.shared.alerts.invalidUrlTitle"), t("connection.shared.alerts.invalidUrlMessage"))
       return
     }
 
     setIsSaving(true)
-    await updateConnection(connection.id, {
-      name: name.trim(),
-      type,
-      url: url.trim(),
-      directory: directory.trim() || undefined,
-      username: username.trim() || undefined,
-    })
-    setIsSaving(false)
-    router.back()
+    try {
+      await updateConnection(
+        connection.id,
+        {
+          name: name.trim(),
+          type,
+          url: url.trim(),
+          directory: directory.trim() || undefined,
+          username: username.trim() || undefined,
+        },
+        // Empty = keep existing password (the field loads blank); a typed value
+        // rotates it in SecureStore.
+        password || undefined,
+      )
+      // If this was the active connection, the SSE loop may have stopped
+      // retrying after a prior 401 (see events.ts) — reconnect now with the
+      // freshly saved credentials instead of leaving the user stuck until
+      // they relaunch the app.
+      if (useConnections.getState().activeConnection?.id === connection.id) {
+        useEvents.getState().connect()
+      }
+      setIsSaving(false)
+      router.back()
+    } catch {
+      setIsSaving(false)
+      Alert.alert(
+        t("connection.shared.alerts.saveFailedTitle"),
+        t("connection.shared.alerts.saveFailedMessage"),
+      )
+    }
   }
 
   const handleDelete = () => {
-    Alert.alert("Delete Connection", `Are you sure you want to delete "${connection.name}"?`, [
-      { text: "Cancel", style: "cancel" },
+    Alert.alert(t("connection.edit.alerts.deleteTitle"), t("connection.edit.alerts.deleteMessage", { name: connection.name }), [
+      { text: t("common.cancel"), style: "cancel" },
       {
-        text: "Delete",
+        text: t("common.delete"),
         style: "destructive",
         onPress: async () => {
           await removeConnection(connection.id)
@@ -130,50 +187,50 @@ export default function EditConnectionScreen() {
       keyboardShouldPersistTaps="handled"
     >
       {/* Connection Type */}
-      <Text style={[styles.label, isDark && styles.labelDark]}>Connection Type</Text>
+      <Text style={[styles.label, isDark && styles.labelDark]}>{t("connection.shared.connectionType")}</Text>
       <View style={styles.typeContainer}>
-        {CONNECTION_TYPES.map((t) => (
+        {CONNECTION_TYPES.map((opt) => (
           <TouchableOpacity
-            key={t.type}
+            key={opt.type}
             style={[
               styles.typeOption,
               isDark && styles.typeOptionDark,
-              type === t.type && styles.typeOptionSelected,
-              type === t.type && isDark && styles.typeOptionSelectedDark,
+              type === opt.type && styles.typeOptionSelected,
+              type === opt.type && isDark && styles.typeOptionSelectedDark,
             ]}
-            onPress={() => setType(t.type)}
+            onPress={() => setType(opt.type)}
           >
             <Ionicons
-              name={t.icon}
+              name={opt.icon}
               size={20}
-              color={type === t.type ? (isDark ? "#0a0a0a" : "#ffffff") : isDark ? "#888888" : "#666666"}
+              color={type === opt.type ? (isDark ? "#0a0a0a" : "#ffffff") : isDark ? "#888888" : "#666666"}
             />
             <Text
               style={[
                 styles.typeLabel,
                 isDark && styles.textDark,
-                type === t.type && styles.typeLabelSelected,
-                type === t.type && isDark && styles.typeLabelSelectedDark,
+                type === opt.type && styles.typeLabelSelected,
+                type === opt.type && isDark && styles.typeLabelSelectedDark,
               ]}
             >
-              {t.label}
+              {t(opt.labelKey)}
             </Text>
           </TouchableOpacity>
         ))}
       </View>
 
       {/* Name */}
-      <Text style={[styles.label, isDark && styles.labelDark]}>Name</Text>
+      <Text style={[styles.label, isDark && styles.labelDark]}>{t("connection.shared.name")}</Text>
       <TextInput
         style={[styles.input, isDark && styles.inputDark]}
-        placeholder="My Server"
+        placeholder={t("connection.shared.namePlaceholder")}
         placeholderTextColor={isDark ? "#666666" : "#999999"}
         value={name}
         onChangeText={setName}
       />
 
       {/* URL */}
-      <Text style={[styles.label, isDark && styles.labelDark]}>Server URL</Text>
+      <Text style={[styles.label, isDark && styles.labelDark]}>{t("connection.shared.serverUrl")}</Text>
       <TextInput
         style={[styles.input, isDark && styles.inputDark]}
         placeholder="http://192.168.1.100:4096"
@@ -186,7 +243,7 @@ export default function EditConnectionScreen() {
       />
 
       {/* Directory */}
-      <Text style={[styles.label, isDark && styles.labelDark]}>Project Directory (Optional)</Text>
+      <Text style={[styles.label, isDark && styles.labelDark]}>{t("connection.shared.directoryOptional")}</Text>
       <TextInput
         style={[styles.input, isDark && styles.inputDark]}
         placeholder="/path/to/project"
@@ -196,14 +253,12 @@ export default function EditConnectionScreen() {
         autoCapitalize="none"
         autoCorrect={false}
       />
-      <Text style={[styles.hint, isDark && styles.hintDark]}>
-        Leave empty to use the server's current directory. Sessions will be created in this folder.
-      </Text>
+      <Text style={[styles.hint, isDark && styles.hintDark]}>{t("connection.edit.directoryHint")}</Text>
 
       {/* Auth */}
-      <Text style={[styles.sectionTitle, isDark && styles.textDark]}>Authentication</Text>
+      <Text style={[styles.sectionTitle, isDark && styles.textDark]}>{t("connection.shared.authentication")}</Text>
 
-      <Text style={[styles.label, isDark && styles.labelDark]}>Username</Text>
+      <Text style={[styles.label, isDark && styles.labelDark]}>{t("connection.shared.username")}</Text>
       <TextInput
         style={[styles.input, isDark && styles.inputDark]}
         placeholder="admin"
@@ -214,7 +269,7 @@ export default function EditConnectionScreen() {
         autoCorrect={false}
       />
 
-      <Text style={[styles.label, isDark && styles.labelDark]}>Password (leave empty to keep existing)</Text>
+      <Text style={[styles.label, isDark && styles.labelDark]}>{t("connection.edit.passwordLabel")}</Text>
       <TextInput
         style={[styles.input, isDark && styles.inputDark]}
         placeholder="••••••••"
@@ -236,7 +291,7 @@ export default function EditConnectionScreen() {
           ) : (
             <>
               <Ionicons name="pulse" size={20} color={isDark ? "#ffffff" : "#0a0a0a"} />
-              <Text style={[styles.testButtonText, isDark && styles.textDark]}>Test Connection</Text>
+              <Text style={[styles.testButtonText, isDark && styles.textDark]}>{t("connection.edit.testButton")}</Text>
             </>
           )}
         </TouchableOpacity>
@@ -249,13 +304,15 @@ export default function EditConnectionScreen() {
           {isSaving ? (
             <ActivityIndicator size="small" color={isDark ? "#0a0a0a" : "#ffffff"} />
           ) : (
-            <Text style={[styles.saveButtonText, isDark && styles.saveButtonTextDark]}>Save Changes</Text>
+            <Text style={[styles.saveButtonText, isDark && styles.saveButtonTextDark]}>
+              {t("connection.edit.saveButton")}
+            </Text>
           )}
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.deleteButton} onPress={handleDelete}>
           <Ionicons name="trash-outline" size={20} color="#ef4444" />
-          <Text style={styles.deleteButtonText}>Delete Connection</Text>
+          <Text style={styles.deleteButtonText}>{t("connection.edit.deleteButton")}</Text>
         </TouchableOpacity>
       </View>
     </ScrollView>

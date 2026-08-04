@@ -3,6 +3,13 @@
 // but works in React Native environment
 // expo/fetch provides WinterCG-compliant fetch with ReadableStream support for SSE
 import { fetch as expoFetch } from "expo/fetch"
+import { buildRequestHeaders } from "./headers"
+import { SSEParser } from "./sse"
+import { apiErrorFor } from "./api-error"
+import { loadSessionList } from "./session-list"
+import type { FileRoot } from "./file-roots"
+
+export { ApiAuthError, isAuthError } from "./api-error"
 
 export interface ClientConfig {
   baseUrl: string
@@ -32,6 +39,13 @@ export interface Session {
     additions: number
     deletions: number
     files: number
+  }
+  // Present while a message (and everything after it) is pending revert —
+  // the server keeps the underlying messages until the next prompt/summarize
+  // call runs cleanup (or the revert is undone via session.unrevert).
+  revert?: {
+    messageID: string
+    partID?: string
   }
 }
 
@@ -141,6 +155,14 @@ export interface Project {
   }
 }
 
+export interface FileEntry {
+  name: string
+  path: string
+  absolute: string
+  type: "file" | "directory"
+  ignored: boolean
+}
+
 export interface Event {
   type: string
   properties: Record<string, unknown>
@@ -153,41 +175,51 @@ export interface HealthResponse {
 
 const REQUEST_TIMEOUT_MS = 30_000
 
-function createHeaders(config: ClientConfig): HeadersInit {
-  const headers: HeadersInit = {
-    "Content-Type": "application/json",
+// Thrown by request() on a non-2xx response. Carries the HTTP status so
+// callers can distinguish e.g. 404 (older server, endpoint missing) from
+// other failures without parsing the message string.
+export class ApiError extends Error {
+  status: number
+  constructor(status: number, body: string) {
+    super(`API Error: ${status} - ${body}`)
+    this.name = "ApiError"
+    this.status = status
   }
-
-  if (config.directory) {
-    const encoded = /[^\x00-\x7F]/.test(config.directory) ? encodeURIComponent(config.directory) : config.directory
-    headers["x-opencode-directory"] = encoded
-  }
-
-  if (config.auth) {
-    const credentials = btoa(`${config.auth.username}:${config.auth.password}`)
-    headers["Authorization"] = `Basic ${credentials}`
-  }
-
-  return headers
 }
 
-async function request<T>(config: ClientConfig, path: string, options: RequestInit = {}): Promise<T> {
+function createHeaders(config: ClientConfig): HeadersInit {
+  return buildRequestHeaders(config)
+}
+
+// `timeoutMs` lets specific callers (e.g. the onboarding health-check) fail
+// faster than the general REQUEST_TIMEOUT_MS used by real session calls.
+// Leave it unset to get the default.
+async function request<T>(
+  config: ClientConfig,
+  path: string,
+  options: RequestInit = {},
+  timeoutMs?: number,
+): Promise<T> {
   const url = `${config.baseUrl}${path}`
   const headers = { ...createHeaders(config), ...options.headers }
-  const response = await fetchWithTimeout(url, {
-    ...options,
-    headers,
-  })
+  const response = await fetchWithTimeout(
+    url,
+    {
+      ...options,
+      headers,
+    },
+    timeoutMs,
+  )
 
   if (!response.ok) {
     const error = await response.text()
-    throw new Error(`API Error: ${response.status} - ${error}`)
+    throw apiErrorFor(response.status, `API Error: ${response.status} - ${error}`)
   }
 
   return response.json()
 }
 
-async function fetchWithTimeout(url: string, options: RequestInit = {}): Promise<Response> {
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Response> {
   const parentSignal = options.signal
   if (parentSignal?.aborted) throw new Error("Request aborted")
 
@@ -196,7 +228,7 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}): Promise
   const timeout = setTimeout(() => {
     timedOut = true
     controller.abort()
-  }, REQUEST_TIMEOUT_MS)
+  }, timeoutMs)
   const onParentAbort = () => controller.abort()
   parentSignal?.addEventListener("abort", onParentAbort)
 
@@ -204,7 +236,7 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}): Promise
     return await fetch(url, { ...options, signal: controller.signal })
   } catch (error) {
     if (timedOut) {
-      throw new Error(`Request timed out after ${REQUEST_TIMEOUT_MS}ms`)
+      throw new Error(`Request timed out after ${timeoutMs}ms`)
     }
     throw error
   } finally {
@@ -214,9 +246,19 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}): Promise
 }
 
 export function createClient(config: ClientConfig) {
+  // Normalize once: a trailing slash on baseUrl (e.g. pasted into Advanced
+  // mode or the Edit screen) would otherwise survive into every
+  // `${config.baseUrl}${path}` concatenation below as a double slash, which
+  // every request then fails against (while the diagnostics probe, which
+  // reconstructs a clean URL, reports "works now"). A bare URL with no
+  // trailing slash is untouched.
+  config = { ...config, baseUrl: config.baseUrl.replace(/\/+$/, "") }
   return {
     global: {
-      health: () => request<HealthResponse>(config, "/global/health"),
+      // `timeoutMs` overrides the default REQUEST_TIMEOUT_MS — used by the
+      // onboarding connection test to fail fast on a bad/unreachable IP
+      // instead of hanging for the full 30s (issue: first-run bounce).
+      health: (timeoutMs?: number) => request<HealthResponse>(config, "/global/health", {}, timeoutMs),
       // SSE event stream - returns async iterator
       // Pass an AbortSignal to cancel the connection
       async *events(signal?: AbortSignal): AsyncGenerator<Event> {
@@ -228,32 +270,35 @@ export function createClient(config: ClientConfig) {
         // Must use expo/fetch for ReadableStream support on native
         const response = await expoFetch(url, { headers, signal })
         if (!response.ok || !response.body) {
-          throw new Error(`Failed to connect to event stream: ${response.status}`)
+          throw apiErrorFor(response.status, `Failed to connect to event stream: ${response.status}`)
         }
 
         const reader = response.body.getReader()
         const decoder = new TextDecoder()
-        let buffer = ""
+        const parser = new SSEParser()
 
+        let receivedFirstByte = false
         try {
           while (true) {
             const { done, value } = await reader.read()
-            if (done) break
+            if (done) {
+              console.log("[SSE] stream ended")
+              break
+            }
 
-            buffer += decoder.decode(value, { stream: true })
-            const lines = buffer.split("\n")
-            buffer = lines.pop() || ""
+            if (!receivedFirstByte) {
+              receivedFirstByte = true
+              console.log(`[SSE] first byte received (${value?.byteLength ?? 0} bytes)`)
+            }
 
-            for (const line of lines) {
-              if (line.startsWith("data: ")) {
-                const data = line.slice(6)
-                if (data && data !== "[DONE]") {
-                  try {
-                    yield JSON.parse(data)
-                  } catch (err) {
-                    console.warn("[SSE] Failed to parse event:", data.slice(0, 200), err)
-                  }
-                }
+            for (const data of parser.push(decoder.decode(value, { stream: true }))) {
+              try {
+                yield JSON.parse(data)
+              } catch (err) {
+                console.warn("[SSE] Failed to parse event", {
+                  length: data.length,
+                  error: err instanceof Error ? err.message : String(err),
+                })
               }
             }
           }
@@ -268,20 +313,63 @@ export function createClient(config: ClientConfig) {
       current: () => request<Project>(config, "/project/current"),
     },
 
+    // Server-side filesystem browsing, scoped to this client's directory
+    // (see ClientConfig.directory / x-opencode-directory header). Use
+    // clientForDirectory(dir) to get a client rooted at a specific folder,
+    // then list("." ) to enumerate its immediate children.
+    file: {
+      list: (params: { path?: string } = {}) => {
+        const query = new URLSearchParams({ path: params.path ?? "." })
+        return request<FileEntry[]>(config, `/file?${query.toString()}`)
+      },
+      // Enumerate the server's filesystem roots (mounted drives, home dir)
+      // to seed the directory browser's pinned top-level entries. Resolves
+      // to null on servers that don't yet expose GET /file/roots (older
+      // opencode builds) so callers fall back to manual path entry instead
+      // of crashing; other errors propagate like any other request.
+      roots: async (): Promise<FileRoot[] | null> => {
+        try {
+          return await request<FileRoot[]>(config, "/file/roots")
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 404) return null
+          throw err
+        }
+      },
+    },
+
     path: {
       get: () =>
         request<{ home: string; state: string; config: string; worktree: string; directory: string }>(config, "/path"),
     },
 
     session: {
-      list: (params?: { roots?: boolean; limit?: number; search?: string }) => {
-        const query = new URLSearchParams()
-        if (params?.roots) query.set("roots", "true")
-        if (params?.limit) query.set("limit", String(params.limit))
-        if (params?.search) query.set("search", params.search)
-        const qs = query.toString()
-        return request<Session[]>(config, `/session${qs ? `?${qs}` : ""}`)
-      },
+      // Prefer the GLOBAL experimental endpoint (all sessions across every
+      // directory) so the Recent Sessions list works without the user first
+      // picking a folder — a directory-less GET /session is directory-scoped
+      // and returns [] on servers whose active dir has no sessions. Shaping
+      // (roots filter, search, sort-by-updated, limit) happens client-side in
+      // loadSessionList; we fetch /experimental/session with no query params
+      // because the server applies `limit` before we can filter to roots.
+      // Falls back to the legacy /session path only on 404 (older servers).
+      list: (params?: { roots?: boolean; limit?: number; search?: string }): Promise<Session[]> =>
+        loadSessionList(
+          {
+            getExperimental: async (): Promise<Session[] | null> => {
+              const response = await fetchWithTimeout(`${config.baseUrl}/experimental/session`, {
+                headers: createHeaders(config),
+              })
+              // Older servers lack this route — signal fallback to legacy /session.
+              if (response.status === 404) return null
+              if (!response.ok) {
+                const body = await response.text()
+                throw apiErrorFor(response.status, `API Error: ${response.status} - ${body}`)
+              }
+              return response.json()
+            },
+            getLegacy: (query) => request<Session[]>(config, `/session${query}`),
+          },
+          params,
+        ),
 
       get: (sessionID: string) => request<Session>(config, `/session/${sessionID}`),
 
@@ -364,6 +452,20 @@ export function createClient(config: ClientConfig) {
         const qs = messageID ? `?messageID=${messageID}` : ""
         return request<unknown[]>(config, `/session/${sessionID}/diff${qs}`)
       },
+
+      // Marks messageID (and everything after it) as pending revert. The
+      // underlying messages aren't deleted until the next prompt runs
+      // cleanup, or the revert is undone with unrevert() below.
+      revert: (sessionID: string, messageID: string, partID?: string) =>
+        request<Session>(config, `/session/${sessionID}/revert`, {
+          method: "POST",
+          body: JSON.stringify(partID ? { messageID, partID } : { messageID }),
+        }),
+
+      unrevert: (sessionID: string) =>
+        request<Session>(config, `/session/${sessionID}/unrevert`, {
+          method: "POST",
+        }),
     },
 
     permission: {
@@ -417,6 +519,7 @@ export function createClient(config: ClientConfig) {
                 cost?: { input: number; output: number }
                 limit: { context: number; output: number }
                 status?: "alpha" | "beta" | "deprecated" | "active"
+                variants?: Record<string, { reasoningEffort?: string }>
               }
             >
           }>

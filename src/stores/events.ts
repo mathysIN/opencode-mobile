@@ -1,37 +1,28 @@
 import { create } from "zustand"
 import { useConnections } from "./connections"
-import { useSessions } from "./sessions"
+import { useSessions, abortedSessions } from "./sessions"
 import { send as notify } from "../lib/notifications"
+import { sanitizeBody } from "../lib/notify-format"
+import { statusFromPart } from "../lib/status-labels"
+import { addBreadcrumb } from "../lib/sentry"
+import { AnalyticsEvent, track } from "../lib/analytics"
+import { recordSuccessfulSession } from "../lib/store-review"
+import { isAuthError } from "../lib/api-error"
+import { isSessionActuallyIdle } from "../lib/session-status-reconcile"
 import type { Client, Part, Session, Message } from "../lib/sdk"
 
 // Session status from the server
 type SessionStatus = { type: "idle" } | { type: "busy" } | { type: "retry"; attempt: number; message: string }
 
-// Tool status labels derived from part type
-const TOOL_STATUS: Record<string, string> = {
-  read: "Gathering context...",
-  list: "Searching codebase...",
-  grep: "Searching codebase...",
-  glob: "Searching codebase...",
-  webfetch: "Searching web...",
-  edit: "Making edits...",
-  write: "Making edits...",
-  apply_patch: "Making edits...",
-  bash: "Running command...",
-  task: "Delegating...",
-  todowrite: "Planning...",
-  todoread: "Planning...",
-}
-
-function statusFromPart(part: Part): string {
-  if (part.type === "reasoning") return "Thinking..."
-  if (part.type === "tool" && part.tool) return TOOL_STATUS[part.tool] || `Running ${part.tool}...`
-  if (part.type === "text") return "Writing..."
-  return "Working..."
-}
-
 interface EventsState {
   connected: boolean
+  // Set when the last connection attempt failed with 401/403 — the server
+  // rejected our credentials, not a transient network issue. The reconnect
+  // loop stops retrying in this case (see connect()) since hammering a
+  // fixed-credential auth failure forever just spams Sentry/battery with no
+  // path to recovery (issue #76). Cleared on the next connect() attempt,
+  // e.g. after the user fixes their credentials on the connection edit screen.
+  authError: boolean
   reconnectAttempts: number
   lastDisconnectAt: number | null
   sessionStatus: Record<string, SessionStatus>
@@ -71,6 +62,12 @@ interface EventsState {
 let controller: AbortController | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
+// Sessions that emitted session.error since they last went busy. SessionStatus
+// has no error variant — an errored session still ends with a busy -> idle
+// transition — so without this mark an errored run would count as a success
+// toward the once-ever store review prompt.
+const erroredSessions = new Set<string>()
+
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000] as const
 const STABLE_CONNECTION_MS = 10_000
 const PROLONGED_DISCONNECT_MS = 30_000
@@ -92,8 +89,65 @@ export async function refreshPending(client: Client, sessionID: string) {
   }
 }
 
+// Re-sync any session currently marked "busy" against the server after an
+// SSE reconnect. sessionStatus/sending are SSE-driven and there is normally
+// no other path to idle — if the server's busy -> idle `session.status`
+// event fired while the network was down, SSE reconnect resumes the stream
+// from "now" (it does not replay missed events), so without this the busy
+// flag would never clear and the UI would show a stuck 'processing' spinner
+// forever (issue #123).
+//
+// Only ever CLEARS a busy flag the server confirms is stale via
+// isSessionActuallyIdle — it never marks a session busy, so it can't
+// clobber a genuinely still-busy session. Also re-checks sessionStatus right
+// before writing, so a real session.status event that lands while the fetch
+// is in flight (e.g. the session went busy again) wins over this resync.
+async function resyncBusySessions() {
+  const busySessionIDs = Object.entries(useEvents.getState().sessionStatus)
+    .filter(([, status]) => status.type === "busy")
+    .map(([sessionID]) => sessionID)
+  if (busySessionIDs.length === 0) return
+
+  await Promise.all(
+    busySessionIDs.map(async (sessionID) => {
+      try {
+        const sessionsState = useSessions.getState()
+        const session =
+          sessionsState.sessions.find((s) => s.id === sessionID) ??
+          (sessionsState.currentSession?.id === sessionID ? sessionsState.currentSession : undefined)
+        const connState = useConnections.getState()
+        const client = session?.directory
+          ? connState.clientForDirectory(session.directory) ?? connState.client
+          : connState.client
+        if (!client) return
+
+        const response = await client.session.messages(sessionID)
+        const messages = (response || []).map((m) => m.info)
+        if (!isSessionActuallyIdle(messages)) return // server says still busy - leave it alone
+
+        // A fresh session.status event may have landed on the SSE stream
+        // while this fetch was in flight — that's authoritative, don't
+        // stomp on it.
+        if (useEvents.getState().sessionStatus[sessionID]?.type !== "busy") return
+
+        useEvents.setState((state) => ({
+          sessionStatus: { ...state.sessionStatus, [sessionID]: { type: "idle" } },
+          statusText: { ...state.statusText, [sessionID]: "" },
+        }))
+        useSessions.setState((state) => ({ sending: { ...state.sending, [sessionID]: false } }))
+        if (useSessions.getState().currentSession?.id === sessionID) {
+          useSessions.getState().refreshMessages()
+        }
+      } catch (err) {
+        console.warn("[Events] Failed to resync session status for", sessionID, err)
+      }
+    }),
+  )
+}
+
 export const useEvents = create<EventsState>((set, get) => ({
   connected: false,
+  authError: false,
   reconnectAttempts: 0,
   lastDisconnectAt: null,
   sessionStatus: {},
@@ -114,12 +168,19 @@ export const useEvents = create<EventsState>((set, get) => ({
 
     controller = new AbortController()
     const currentController = controller
-    set({ connected: true })
+    set({ connected: true, authError: false })
     console.log("[SSE] Connecting to event stream...")
+    addBreadcrumb({ category: "sse", message: "connecting" })
 
     // Run in background
     ;(async () => {
       let reconnectScheduled = false
+      // True if this connect() call is resuming after a prior disconnect —
+      // gates the one-time busy-session resync below so a cold app start
+      // (sessionStatus is always empty then) never triggers it, and a run of
+      // failed retries can't re-arm the check on every attempt.
+      const isReconnect = get().reconnectAttempts > 0
+      let resyncedAfterReconnect = false
       const stableTimer = setTimeout(() => {
         if (!currentController.signal.aborted) {
           set({ reconnectAttempts: 0, lastDisconnectAt: null })
@@ -139,7 +200,7 @@ export const useEvents = create<EventsState>((set, get) => ({
           notify({
             category: "connection",
             title: "Connection interrupted",
-            body: "Trying to reconnect to your server",
+            body: sanitizeBody(undefined, "Trying to reconnect to your server"),
             sessionId: "",
             dedupeKey: "sse-prolonged-disconnect",
             dedupeCooldownMs: 60_000,
@@ -149,6 +210,12 @@ export const useEvents = create<EventsState>((set, get) => ({
         const baseDelay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempts - 1, RECONNECT_DELAYS_MS.length - 1)]
         const jitteredDelay = Math.min(15_000, Math.round(baseDelay * (0.75 + Math.random() * 0.5)))
         console.warn(`[SSE] Connection lost, reconnecting in ${jitteredDelay}ms:`, reason)
+        addBreadcrumb({
+          category: "sse",
+          level: "warning",
+          message: "reconnect scheduled",
+          data: { attempt: reconnectAttempts, delayMs: jitteredDelay, reason: String(reason).slice(0, 200) },
+        })
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null
           get().connect()
@@ -158,6 +225,14 @@ export const useEvents = create<EventsState>((set, get) => ({
       try {
         for await (const event of client.global.events(currentController.signal)) {
           if (currentController.signal.aborted) break
+
+          // The stream is genuinely live again (we're actually receiving
+          // data, not just optimistically marked "connected") — resync once
+          // per reconnect, not on every event.
+          if (isReconnect && !resyncedAfterReconnect) {
+            resyncedAfterReconnect = true
+            void resyncBusySessions()
+          }
 
           const payload = (event as any).payload || event
           const type = payload.type as string
@@ -172,6 +247,12 @@ export const useEvents = create<EventsState>((set, get) => ({
               // Detect busy → idle transition for completion notification
               const previous = get().sessionStatus[sessionID]
               const completed = previous?.type === "busy" && status.type === "idle"
+
+              // A new run starts — forget any error/abort from the previous one
+              if (status.type === "busy") {
+                erroredSessions.delete(sessionID)
+                abortedSessions.delete(sessionID)
+              }
 
               set((state) => ({
                 sessionStatus: { ...state.sessionStatus, [sessionID]: status },
@@ -192,13 +273,30 @@ export const useEvents = create<EventsState>((set, get) => ({
               }
 
               if (completed) {
-                const match = useSessions.getState().sessions.find((s) => s.id === sessionID)
-                notify({
-                  category: "completed",
-                  title: "Task completed",
-                  body: match?.title || "Session finished processing",
-                  sessionId: sessionID,
-                })
+                // A user-cancelled run still ends busy -> idle; don't count it
+                // as a received response or a review-worthy success.
+                const aborted = abortedSessions.has(sessionID)
+                if (!aborted) track(AnalyticsEvent.ResponseReceived)
+                // Only notify "Task completed" for a genuine completion — a
+                // user-cancelled run didn't complete, and an errored run
+                // already fired its own "Session error" notification (session.error
+                // doesn't touch sessionStatus, so an errored session still lands
+                // here via busy→idle). Without this guard the user gets a
+                // misleading — or duplicate, contradictory — completion push.
+                if (!aborted && !erroredSessions.has(sessionID)) {
+                  const match = useSessions.getState().sessions.find((s) => s.id === sessionID)
+                  notify({
+                    category: "completed",
+                    title: "Task completed",
+                    body: sanitizeBody(match?.title, "Session finished processing"),
+                    sessionId: sessionID,
+                  })
+                }
+                // Genuinely positive moment — count it toward the one-time
+                // store review prompt, but only if this run never errored
+                // (session.error doesn't touch sessionStatus, so an errored
+                // session still lands here via busy -> idle) and wasn't aborted.
+                if (!aborted && !erroredSessions.has(sessionID)) void recordSuccessfulSession()
               }
               break
             }
@@ -249,6 +347,9 @@ export const useEvents = create<EventsState>((set, get) => ({
               const error = props.error as { message?: string } | undefined
               const sessionID = props.sessionID as string
               if (!sessionID) break
+              // Mark so the eventual busy -> idle transition is not counted
+              // as a success for the store review prompt
+              erroredSessions.add(sessionID)
               // Clear sending state unconditionally — SSE is truth
               useSessions.setState((state) => ({
                 sending: { ...state.sending, [sessionID]: false },
@@ -263,7 +364,7 @@ export const useEvents = create<EventsState>((set, get) => ({
               notify({
                 category: "errors",
                 title: "Session error",
-                body: error?.message || "Something went wrong",
+                body: sanitizeBody(error?.message, "Something went wrong"),
                 sessionId: sessionID,
               })
               break
@@ -282,9 +383,18 @@ export const useEvents = create<EventsState>((set, get) => ({
               }))
               notify({
                 category: "permissions",
-                title: req.permission || "Permission requested",
-                body: req.patterns?.join(", ") || "A tool needs your approval",
+                title: "Agent needs approval",
+                body: sanitizeBody(
+                  req.permission
+                    ? req.patterns?.length
+                      ? `${req.permission}: ${req.patterns.join(", ")}`
+                      : req.permission
+                    : req.patterns?.join(", "),
+                  "A tool needs your approval",
+                ),
                 sessionId: req.sessionID,
+                dedupeKey: `perm-${req.id}`,
+                dedupeCooldownMs: 60_000,
               })
               break
             }
@@ -316,8 +426,10 @@ export const useEvents = create<EventsState>((set, get) => ({
               notify({
                 category: "questions",
                 title: req.questions?.[0]?.header || "Input needed",
-                body: req.questions?.[0]?.question || "The assistant has a question",
+                body: sanitizeBody(req.questions?.[0]?.question, "The assistant has a question"),
                 sessionId: req.sessionID,
+                dedupeKey: `question-${req.id}`,
+                dedupeCooldownMs: 60_000,
               })
               break
             }
@@ -340,7 +452,24 @@ export const useEvents = create<EventsState>((set, get) => ({
 
         scheduleReconnect(new Error("Event stream closed"))
       } catch (err) {
-        scheduleReconnect(err)
+        if (isAuthError(err) && !currentController.signal.aborted) {
+          // Bad credentials, not a transient failure — retrying forever just
+          // spams Sentry and drains the battery with zero path to recovery
+          // (issue #76: 309 events / 65 users). Stop and surface a distinct
+          // state instead; the sessions screen offers a link to fix
+          // credentials, which reconnects via connect() once saved.
+          console.warn("[SSE] Authentication failed — stopping reconnect loop:", err)
+          addBreadcrumb({
+            category: "sse",
+            level: "error",
+            message: "auth error - stopped retrying",
+            data: { status: err.status },
+          })
+          track(AnalyticsEvent.ConnectionFailed, { source: "sse", error_class: "unauthorized" })
+          set({ connected: false, authError: true })
+        } else {
+          scheduleReconnect(err)
+        }
       } finally {
         clearTimeout(stableTimer)
         if (currentController.signal.aborted) {
@@ -352,14 +481,18 @@ export const useEvents = create<EventsState>((set, get) => ({
 
   disconnect: () => {
     console.log("[SSE] Disconnecting")
+    addBreadcrumb({ category: "sse", message: "disconnected" })
     if (reconnectTimer) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
     }
     controller?.abort()
     controller = null
+    erroredSessions.clear()
+    abortedSessions.clear()
     set({
       connected: false,
+      authError: false,
       reconnectAttempts: 0,
       lastDisconnectAt: null,
       sessionStatus: {},
